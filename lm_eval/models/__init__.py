@@ -38,6 +38,8 @@ MODEL_MAPPING = {
     "ipex": "lm_eval.models.optimum_ipex:IPEXForCausalLM",
     "local-chat-completions": "lm_eval.models.openai_completions:LocalChatCompletion",
     "local-completions": "lm_eval.models.openai_completions:LocalCompletionsAPI",
+    "litert-lm": "lm_eval.models.litert_lm:LiteRTLM",
+    "litert_lm": "lm_eval.models.litert_lm:LiteRTLM",
     "mamba_ssm": "lm_eval.models.mamba_lm:MambaLMWrapper",
     "megatron_lm": "lm_eval.models.megatron_lm:MegatronLMEval",
     "nemo_lm": "lm_eval.models.nemo_lm:NeMoLM",
