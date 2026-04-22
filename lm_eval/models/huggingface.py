@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from datetime import timedelta
@@ -108,6 +109,7 @@ class HFLM(TemplateLM):
         think_end_token: str | int | None = None,
         enable_thinking: bool | None = None,
         chat_template_args: dict[str, Any] | None = None,
+        causal_loglikelihood_logits_to_keep: bool = False,
         **kwargs,
     ) -> None:
         """Initialize an HFLM instance for evaluating HuggingFace models.
@@ -199,6 +201,9 @@ class HFLM(TemplateLM):
                 formatter.
             chat_template_args: Additional keyword arguments to pass to the
                 chat template when formatting inputs.
+            causal_loglikelihood_logits_to_keep: When ``True``, causal
+                loglikelihood scoring uses model-specific ``logits_to_keep``
+                support to request only the continuation tail logits.
             **kwargs: Additional keyword arguments forwarded to the model
                 constructor (e.g. ``transformers.AutoModelForCausalLM.from_pretrained``).
         """
@@ -381,6 +386,15 @@ class HFLM(TemplateLM):
             if mixed_precision_dtype is not None
             else None
         )
+        self.causal_loglikelihood_logits_to_keep = bool(
+            causal_loglikelihood_logits_to_keep
+        )
+        try:
+            self._supports_logits_to_keep = (
+                "logits_to_keep" in inspect.signature(self.model.forward).parameters
+            )
+        except (TypeError, ValueError):
+            self._supports_logits_to_keep = False
 
         if str(batch_size).startswith("auto"):
             batch_size = batch_size.split(":")
@@ -951,6 +965,15 @@ class HFLM(TemplateLM):
                 test_batch = torch.ones(
                     (batch_size, max_length), device=self.device
                 ).long()
+                if (
+                    self.backend == "causal"
+                    and self.causal_loglikelihood_logits_to_keep
+                    and self._supports_logits_to_keep
+                ):
+                    call_kwargs = {
+                        "attn_mask": torch.ones_like(test_batch),
+                        "logits_to_keep": max(1, max_cont_enc),
+                    }
             for _ in range(5):
                 out = F.log_softmax(  # noqa: F841
                     self._model_call(test_batch, **call_kwargs),
@@ -1055,6 +1078,7 @@ class HFLM(TemplateLM):
         inps: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
+        logits_to_keep: int | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
 
@@ -1079,12 +1103,20 @@ class HFLM(TemplateLM):
                 enabled=self.mixed_precision_dtype is not None,
             ),
         ):
-            if attn_mask is not None or labels is not None:
-                assert attn_mask is not None and labels is not None
+            if labels is not None:
+                assert attn_mask is not None
                 assert transformers.AutoModelForSeq2SeqLM == self.AUTO_MODEL_CLASS
                 return self.model(
                     input_ids=inps, attention_mask=attn_mask, labels=labels
                 ).logits
+
+            call_kwargs = {}
+            if attn_mask is not None:
+                call_kwargs["attention_mask"] = attn_mask
+            if logits_to_keep is not None:
+                call_kwargs["logits_to_keep"] = logits_to_keep
+            if call_kwargs:
+                return self.model(input_ids=inps, **call_kwargs).logits
 
             # assert self.AUTO_MODEL_CLASS in (
             #     transformers.AutoModelForCausalLM,
@@ -1330,6 +1362,11 @@ class HFLM(TemplateLM):
             disable=(disable_tqdm or (self.rank != 0)),
             desc="Running loglikelihood requests",
         )
+        use_tail_logits = (
+            self.backend == "causal"
+            and self.causal_loglikelihood_logits_to_keep
+            and self._supports_logits_to_keep
+        )
         for chunk in chunks:
             inps = []
             cont_toks_list = []
@@ -1414,9 +1451,28 @@ class HFLM(TemplateLM):
             call_kwargs = {}
             assert padding_len_inp, "padding_len_inp should be set by now"
             if self.backend == "causal":
-                batched_inps = pad_and_concat(
-                    padding_len_inp, inps, padding_side="right"
-                )  # [batch, padding_len_inp]
+                if use_tail_logits:
+                    batched_inps = torch.full(
+                        (len(inps), padding_len_inp),
+                        fill_value=self.tokenizer.pad_token_id,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    batched_attention_mask = torch.zeros_like(batched_inps)
+                    for row, inp in enumerate(inps):
+                        seq_len = int(inp.shape[0])
+                        batched_inps[row, -seq_len:] = inp
+                        batched_attention_mask[row, -seq_len:] = 1
+                    call_kwargs = {
+                        "attn_mask": batched_attention_mask,
+                        "logits_to_keep": max(
+                            1, max(len(cont_toks) for cont_toks in cont_toks_list)
+                        ),
+                    }
+                else:
+                    batched_inps = pad_and_concat(
+                        padding_len_inp, inps, padding_side="right"
+                    )  # [batch, padding_len_inp]
             elif self.backend == "seq2seq":
                 assert padding_len_cont, "padding_len_cont should be set by now"
                 # TODO: left-pad encoder inps and mask?
@@ -1454,7 +1510,12 @@ class HFLM(TemplateLM):
                     if self.backend == "causal"
                     else None
                 )
-                logits = self._select_cont_toks(logits, contlen=contlen, inplen=ctx_len)
+                if use_tail_logits:
+                    logits = logits[-contlen:]
+                else:
+                    logits = self._select_cont_toks(
+                        logits, contlen=contlen, inplen=ctx_len
+                    )
                 logits = logits.unsqueeze(0)  # [1, seq, vocab]
 
                 # Check if per-token argmax is exactly equal to continuation

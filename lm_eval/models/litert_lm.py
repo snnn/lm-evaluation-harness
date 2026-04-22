@@ -35,6 +35,8 @@ class LiteRTLM(TemplateLM):
         cache_dir: str = "",
         prompt_mode: str = "raw",
         input_prompt_as_hint: str = "",
+        num_cpu_threads: int = 0,
+        prefill_chunk_size: int = -1,
         **_: Any,
     ) -> None:
         super().__init__()
@@ -54,6 +56,8 @@ class LiteRTLM(TemplateLM):
         self.max_batch_size = max_batch_size
         self.max_gen_toks = max_gen_toks
         self.prompt_mode = prompt_mode
+        self.num_cpu_threads = int(num_cpu_threads)
+        self.prefill_chunk_size = int(prefill_chunk_size)
         self._device = backend
         self._backend = self._parse_backend(backend)
         self.backend = "causal"
@@ -80,6 +84,8 @@ class LiteRTLM(TemplateLM):
             max_num_tokens=self.max_length,
             cache_dir=cache_dir,
             input_prompt_as_hint=input_prompt_as_hint,
+            num_cpu_threads=self.num_cpu_threads,
+            prefill_chunk_size=self.prefill_chunk_size,
         )
         self.tokenizer = None
         self._bos_token_id = self.engine.bos_token_id
@@ -115,6 +121,19 @@ class LiteRTLM(TemplateLM):
         return self.engine.create_session(
             apply_prompt_template=(self.prompt_mode == "bundle")
         )
+
+    def _make_generate_config(self, max_output_tokens: int):
+        config_cls = getattr(self._litert_lm, "GenerateConfig", None)
+        if config_cls is None:
+            config_cls = getattr(self._litert_lm, "DecodeOptions")
+        return config_cls(max_output_tokens=max_output_tokens)
+
+    @staticmethod
+    def _is_greedy_match(scoring: Any, index: int, continuation_enc: list[int]) -> bool:
+        greedy_token_ids = getattr(scoring, "greedy_token_ids", None)
+        if not greedy_token_ids or index >= len(greedy_token_ids):
+            return False
+        return list(greedy_token_ids[index]) == list(continuation_enc)
 
     def _tokenize(self, string: str) -> list[int]:
         return list(self.engine.tokenize(string))
@@ -166,28 +185,7 @@ class LiteRTLM(TemplateLM):
         requests: list["Instance"],
         disable_tqdm: bool = False,
     ) -> list[tuple[float, bool]]:
-        results = []
-
-        for request in tqdm(
-            requests,
-            disable=disable_tqdm,
-            desc="Running loglikelihood requests",
-        ):
-            context, continuation = request.args
-            if continuation == "":
-                result = (0.0, True)
-                results.append(result)
-                self.cache_hook.add_partial("loglikelihood", request.args, result)
-                continue
-
-            with self._make_session() as session:
-                session.run_prefill([context])
-                scoring = session.run_text_scoring([continuation])
-            result = (float(scoring.scores[0]), False)
-            results.append(result)
-            self.cache_hook.add_partial("loglikelihood", request.args, result)
-
-        return results
+        return super().loglikelihood(requests, disable_tqdm=disable_tqdm)
 
     def _loglikelihood_tokens(
         self,
@@ -195,15 +193,62 @@ class LiteRTLM(TemplateLM):
         disable_tqdm: bool = False,
         **_: Any,
     ) -> list[tuple[float, bool]]:
-        del requests, disable_tqdm
-        raise NotImplementedError(
-            "LiteRT-LM overrides loglikelihood() directly and does not use "
-            "_loglikelihood_tokens()."
-        )
+        if self.prompt_mode != "raw":
+            raise NotImplementedError(
+                "LiteRT-LM token-scoring path currently requires prompt_mode=raw."
+            )
+
+        results: list[tuple[float, bool] | None] = [None] * len(requests)
+        grouped_requests: dict[
+            tuple[int, ...],
+            list[tuple[int, tuple[str, str], list[int], list[int]]],
+        ] = {}
+
+        for index, request in enumerate(requests):
+            cache_key, context_enc, continuation_enc = request
+            if not continuation_enc:
+                result = (0.0, True)
+                results[index] = result
+                self.cache_hook.add_partial("loglikelihood", cache_key, result)
+                continue
+            grouped_requests.setdefault(tuple(context_enc), []).append(
+                (index, cache_key, context_enc, continuation_enc)
+            )
+
+        for context_key, group in tqdm(
+            grouped_requests.items(),
+            disable=disable_tqdm,
+            desc="Running loglikelihood requests",
+            total=len(grouped_requests),
+        ):
+            del context_key
+            context_enc = group[0][2]
+            continuation_encs = [continuation_enc for _, _, _, continuation_enc in group]
+
+            with self._make_session() as session:
+                session.run_prefill_token_ids(context_enc)
+                scoring = session.run_token_scoring(continuation_encs)
+
+            for score_index, (score, (index, cache_key, _, continuation_enc)) in enumerate(
+                zip(scoring.scores, group, strict=True)
+            ):
+                result = (
+                    float(score),
+                    self._is_greedy_match(scoring, score_index, continuation_enc),
+                )
+                results[index] = result
+                self.cache_hook.add_partial("loglikelihood", cache_key, result)
+
+        return [result for result in results if result is not None]
 
     def loglikelihood_rolling(
         self, requests: list["Instance"], disable_tqdm: bool = False
     ) -> list[float]:
+        if self.prompt_mode != "raw":
+            raise NotImplementedError(
+                "LiteRT-LM token-scoring path currently requires prompt_mode=raw."
+            )
+
         loglikelihoods = []
 
         for request in tqdm(
@@ -227,15 +272,8 @@ class LiteRTLM(TemplateLM):
             total_score = 0.0
             for context_tokens, continuation_tokens in rolling_windows:
                 with self._make_session() as session:
-                    context_text = (
-                        ""
-                        if context_tokens == [self.prefix_token_id]
-                        else self.tok_decode(context_tokens)
-                    )
-                    session.run_prefill([context_text])
-                    scoring = session.run_text_scoring(
-                        [self.tok_decode(continuation_tokens)]
-                    )
+                    session.run_prefill_token_ids(context_tokens)
+                    scoring = session.run_token_scoring([continuation_tokens])
                 total_score += float(scoring.scores[0])
 
             loglikelihoods.append(total_score)
@@ -264,10 +302,11 @@ class LiteRTLM(TemplateLM):
                     "LiteRT-LM backend currently uses greedy generation for "
                     "lm-eval; sampling kwargs are ignored."
                 )
+            decode_config = self._make_generate_config(int(gen_kwargs["max_gen_toks"]))
 
             with self._make_session() as session:
                 session.run_prefill([context])
-                responses = session.run_decode()
+                responses = session.run_decode(decode_config)
 
             text = responses.texts[0] if responses.texts else ""
             for stop_string in until:
